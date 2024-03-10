@@ -2,10 +2,28 @@ package com.unciv.models.translations
 
 import com.badlogic.gdx.Gdx
 import com.badlogic.gdx.files.FileHandle
-import com.badlogic.gdx.utils.Array
-import com.unciv.JsonParser
+import com.unciv.json.fromJsonFile
+import com.unciv.json.json
+import com.unciv.logic.civilization.diplomacy.DiplomaticModifiers
+import com.unciv.models.SpyAction
 import com.unciv.models.metadata.BaseRuleset
-import com.unciv.models.ruleset.*
+import com.unciv.models.metadata.GameSettings.LocaleCode
+import com.unciv.models.ruleset.Belief
+import com.unciv.models.ruleset.Building
+import com.unciv.models.ruleset.Event
+import com.unciv.models.ruleset.GlobalUniques
+import com.unciv.models.ruleset.PolicyBranch
+import com.unciv.models.ruleset.Quest
+import com.unciv.models.ruleset.RuinReward
+import com.unciv.models.ruleset.RulesetCache
+import com.unciv.models.ruleset.Specialist
+import com.unciv.models.ruleset.Speed
+import com.unciv.models.ruleset.Tutorial
+import com.unciv.models.ruleset.Victory
+import com.unciv.models.ruleset.nation.CityStateType
+import com.unciv.models.ruleset.nation.Difficulty
+import com.unciv.models.ruleset.nation.Nation
+import com.unciv.models.ruleset.tech.Era
 import com.unciv.models.ruleset.tech.TechColumn
 import com.unciv.models.ruleset.tile.Terrain
 import com.unciv.models.ruleset.tile.TileImprovement
@@ -13,12 +31,15 @@ import com.unciv.models.ruleset.tile.TileResource
 import com.unciv.models.ruleset.unique.Unique
 import com.unciv.models.ruleset.unique.UniqueFlag
 import com.unciv.models.ruleset.unique.UniqueParameterType
+import com.unciv.models.ruleset.unique.UniqueTarget
 import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.ruleset.unit.Promotion
 import com.unciv.models.ruleset.unit.UnitType
-import com.unciv.models.stats.Stat
-import com.unciv.models.stats.Stats
+import com.unciv.ui.components.input.KeyboardBinding
+import com.unciv.utils.Log
+import com.unciv.utils.debug
+import java.io.File
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
 
@@ -27,14 +48,27 @@ object TranslationFileWriter {
     private const val specialNewLineCode = "# This is an empty line "
     const val templateFileLocation = "jsons/translations/template.properties"
     private const val languageFileLocation = "jsons/translations/%s.properties"
+    private const val shortDescriptionKey = "Fastlane_short_description"
+    private const val shortDescriptionFile = "short_description.txt"
+    private const val fullDescriptionKey = "Fastlane_full_description"
+    private const val fullDescriptionFile = "full_description.txt"
+    // Current dir on desktop should be assets, so use two '..' get us to project root
+    private const val fastlanePath = "../../fastlane/metadata/android/"
 
+    //region Update translation files
     fun writeNewTranslationFiles(): String {
         try {
             val translations = Translations()
             translations.readAllLanguagesTranslation()
 
-            val percentages = generateTranslationFiles(translations)
-            writeLanguagePercentages(percentages)
+            var fastlaneOutput = ""
+            // check to make sure we're not running from a jar since these users shouldn't need to
+            // regenerate base game translation and fastlane files
+            if (TranslationFileWriter.javaClass.`package`.specificationVersion == null) {
+                val percentages = generateTranslationFiles(translations)
+                writeLanguagePercentages(percentages)
+                fastlaneOutput = "\n" + writeTranslatedFastlaneFiles(translations)
+            }
 
             // See #5168 for some background on this
             for ((modName, modTranslations) in translations.modsWithTranslations) {
@@ -43,9 +77,10 @@ object TranslationFileWriter {
                 writeLanguagePercentages(modPercentages, modFolder)  // unused by the game but maybe helpful for the mod developer
             }
 
-            return "Translation files are generated successfully."
+            return "Translation files are generated successfully.".tr() + fastlaneOutput
         } catch (ex: Throwable) {
-            return ex.localizedMessage
+            Log.error("Failed to generate translation files", ex)
+            return ex.localizedMessage ?: ex.javaClass.simpleName
         }
     }
 
@@ -68,53 +103,66 @@ object TranslationFileWriter {
         val linesToTranslate = mutableListOf<String>()
 
         if (modFolder == null) { // base game
-            val templateFile = getFileHandle(modFolder, templateFileLocation) // read the template
+            val templateFile = getFileHandle(null, templateFileLocation) // read the template
             if (templateFile.exists())
                 linesToTranslate.addAll(templateFile.reader(TranslationFileReader.charset).readLines())
 
-            linesToTranslate += "\n######### City filters ###########\n"
-            linesToTranslate.addAll(UniqueParameterType.cityFilterStrings.map { "$it = " })
+            linesToTranslate += "\n\n#################### Lines from Unique Types #######################\n"
+            for (uniqueType in UniqueType.values()) {
+                val deprecationAnnotation = uniqueType.getDeprecationAnnotation()
+                if (deprecationAnnotation != null) continue
+                if (uniqueType.flags.contains(UniqueFlag.HiddenToUsers)) continue
+
+                linesToTranslate += "${uniqueType.getTranslatable()} = "
+            }
+
+            for (uniqueParameterType in UniqueParameterType.values()) {
+                val strings = uniqueParameterType.getTranslationWriterStringsForOutput()
+                if (strings.isEmpty()) continue
+                linesToTranslate += "\n######### ${uniqueParameterType.displayName} ###########\n"
+                linesToTranslate.addAll(strings.map { "$it = " })
+            }
+
+            for (uniqueTarget in UniqueTarget.values())
+                linesToTranslate += "$uniqueTarget = "
+
+            linesToTranslate += "\n\n#################### Lines from spy actions #######################\n"
+            for (spyAction in SpyAction.values()) {
+                linesToTranslate += "${spyAction.displayString} = "
+            }
+
+            linesToTranslate += "\n\n#################### Lines from diplomatic modifiers #######################\n"
+            for (diplomaticModifier in DiplomaticModifiers.values())
+                linesToTranslate += "${diplomaticModifier.text} = "
+
+            linesToTranslate += "\n\n#################### Lines from key bindings #######################\n"
+            for (category in KeyboardBinding.Category.values()) {
+                linesToTranslate += "${category.label} = "
+            }
+            for (binding in KeyboardBinding.values()) {
+                linesToTranslate += "${binding.label} = "
+            }
 
             for (baseRuleset in BaseRuleset.values()) {
                 val generatedStringsFromBaseRuleset =
-                        generateStringsFromJSONs(Gdx.files.local("jsons/${baseRuleset.fullName}"))
+                        GenerateStringsFromJSONs(Gdx.files.local("jsons/${baseRuleset.fullName}"))
                 for (entry in generatedStringsFromBaseRuleset)
                     fileNameToGeneratedStrings[entry.key + " from " + baseRuleset.fullName] = entry.value
             }
 
-            fileNameToGeneratedStrings["Tutorials"] = generateTutorialsStrings()
+            // Tutorials reside one level above the base rulesets - if they were per-ruleset the following lines would be unnecessary
+            val tutorialStrings = GenerateStringsFromJSONs(Gdx.files.local("jsons")) { it.name == "Tutorials.json" }
+            fileNameToGeneratedStrings["Tutorials"] = tutorialStrings.values.first()
         } else {
-            fileNameToGeneratedStrings.putAll(generateStringsFromJSONs(modFolder.child("jsons")))
+            fileNameToGeneratedStrings.putAll(GenerateStringsFromJSONs(modFolder.child("jsons")))
         }
 
-        for (key in fileNameToGeneratedStrings.keys) {
-            linesToTranslate.add("\n#################### Lines from $key ####################\n")
-            linesToTranslate.addAll(fileNameToGeneratedStrings.getValue(key))
+        for ((key, value) in fileNameToGeneratedStrings) {
+            if (value.isEmpty()) continue
+            linesToTranslate += "\n#################### Lines from $key ####################\n"
+            linesToTranslate.addAll(value)
         }
-
-
-        linesToTranslate.add("\n\n#################### Lines from Unique Types #######################\n")
-        for (unique in UniqueType.values()) {
-            val deprecationAnnotation = unique.declaringClass.getField(unique.name)
-                .getAnnotation(Deprecated::class.java)
-            if (deprecationAnnotation != null) continue
-            if (unique.flags.contains(UniqueFlag.HiddenToUsers)) continue
-
-            // to get rid of multiple equal parameters, like "[amount] [amount]", don't use the unique.text directly
-            //  instead fill the placeholders with incremented values if the previous one exists
-            val newPlaceholders = ArrayList<String>()
-            for (placeholderText in unique.text.getPlaceholderParameters()) {
-                if (!newPlaceholders.contains(placeholderText))
-                    newPlaceholders += placeholderText
-                else {
-                    var i = 2
-                    while (newPlaceholders.contains(placeholderText + i)) i++
-                    newPlaceholders += placeholderText + i
-                }
-            }
-            val finalText = unique.text.fillPlaceholders(*newPlaceholders.toTypedArray())
-            linesToTranslate.add("$finalText = ")
-        }
+        fileNameToGeneratedStrings.clear()  // No longer needed
 
         var countOfTranslatableLines = 0
         val countOfTranslatedLines = HashMap<String, Int>()
@@ -131,16 +179,14 @@ object TranslationFileWriter {
                 if (!line.contains(" = ")) {
                     // small hack to insert empty lines
                     if (line.startsWith(specialNewLineCode)) {
-                        if (!stringBuilder.endsWith("\r\n\r\n")) // don't double-add line breaks -
-                        // this stops lots of line breaks between removed translations in G&K
-                            stringBuilder.appendLine()
+                        stringBuilder.appendLine()
                     } else // copy as-is
                         stringBuilder.appendLine(line)
                     continue
                 }
 
                 val translationKey = line.split(" = ")[0].replace("\\n", "\n")
-                val hashMapKey = 
+                val hashMapKey =
                     if (translationKey == Translations.englishConditionalOrderingString)
                         Translations.englishConditionalOrderingString
                     else translationKey
@@ -154,7 +200,7 @@ object TranslationFileWriter {
                 if (languageIndex == 0) countOfTranslatableLines++
 
                 val existingTranslation = translations[hashMapKey]
-                var translationValue = if (existingTranslation != null && language in existingTranslation){
+                var translationValue = if (existingTranslation != null && language in existingTranslation) {
                     translationsOfThisLanguage++
                     existingTranslation[language]!!
                 } else if (baseTranslations?.get(hashMapKey)?.containsKey(language) == true) {
@@ -184,9 +230,7 @@ object TranslationFileWriter {
                         )
                 }
 
-                val lineToWrite = translationKey.replace("\n", "\\n") +
-                        " = " + translationValue.replace("\n", "\\n")
-                stringBuilder.appendLine(lineToWrite)
+                stringBuilder.appendTranslation(translationKey, translationValue)
             }
 
             countOfTranslatedLines[language] = translationsOfThisLanguage
@@ -205,237 +249,336 @@ object TranslationFileWriter {
         return countOfTranslatedLines
     }
 
+    private fun StringBuilder.appendTranslation(key: String, value: String) {
+        appendLine(key.replace("\n", "\\n") +
+                " = " + value.replace("\n", "\\n"))
+    }
+
     private fun writeLanguagePercentages(percentages: HashMap<String, Int>, modFolder: FileHandle? = null) {
         val output = percentages.asSequence()
+            .sortedBy { it.key }
             .joinToString("\n", postfix = "\n") { "${it.key} = ${it.value}" }
         getFileHandle(modFolder, TranslationFileReader.percentagesFileLocation)
             .writeString(output, false)
     }
 
-    private fun generateTutorialsStrings(): MutableSet<String> {
-
-        val tutorialsStrings = mutableSetOf<String>()
-        val tutorials = JsonParser().getFromJson(LinkedHashMap<String, Array<String>>().javaClass, "jsons/Tutorials.json")
-
-        var uniqueIndexOfNewLine = 0
-        for (tutorial in tutorials) {
-            if (!tutorial.key.startsWith('_'))
-                tutorialsStrings.add("${tutorial.key.replace('_', ' ')} = ")
-            for (str in tutorial.value)
-                if (str != "") tutorialsStrings.add("$str = ")
-            // This is a small hack to insert multiple /n into the set, which can't contain identical lines
-            tutorialsStrings.add("$specialNewLineCode ${uniqueIndexOfNewLine++}")
-        }
-        return tutorialsStrings
-    }
-
     // used for unit test only
     fun getGeneratedStringsSize(): Int {
-        return generateStringsFromJSONs(Gdx.files.local("jsons/Civ V - Vanilla")).values.sumOf { // exclude empty lines
+        return GenerateStringsFromJSONs(Gdx.files.local("jsons/Civ V - Vanilla")).values.sumOf {
+            // exclude empty lines
             it.count { line: String -> !line.startsWith(specialNewLineCode) }
         }
     }
 
-    private fun generateStringsFromJSONs(jsonsFolder: FileHandle): LinkedHashMap<String, MutableSet<String>> {
-        // build maps identifying parameters as certain types of filters - unitFilter etc
-        val ruleset = RulesetCache.getBaseRuleset()
-        val tileFilterMap = ruleset.terrains.keys.toMutableSet().apply { addAll(sequenceOf(
-            "Friendly Land",
-            "Foreign Land",
-            "Fresh water",
-            "non-fresh water",
-            "Open Terrain",
-            "Rough Terrain",
-            "Natural Wonder",
-            "unimproved"
-        )) }
-        val tileImprovementMap = ruleset.tileImprovements.keys.toMutableSet().apply { add("Great Improvement") }
-        val buildingMap = ruleset.buildings.keys.toMutableSet().apply { addAll(sequenceOf(
-            "Wonders",
-            "Wonder",
-            "Buildings",
-            "Building"
-        )) }
-        val unitTypeMap = ruleset.unitTypes.keys.toMutableSet().apply { addAll(UniqueParameterType.unitTypeStrings) }
+    private fun UniqueType.getTranslatable(): String {
+        // to get rid of multiple equal parameters, like "[amount] [amount]", don't use the unique.text directly
+        //  instead fill the placeholders with incremented values if the previous one exists
+        val newPlaceholders = ArrayList<String>()
+        for (placeholderText in text.getPlaceholderParameters()) {
+            newPlaceholders.addNumberedParameter(placeholderText)
+        }
+        return text.fillPlaceholders(*newPlaceholders.toTypedArray())
+    }
 
+    private fun ArrayList<String>.addNumberedParameter(name: String) {
+        if (name !in this) {
+            this += name
+            return
+        }
+        var i = 2
+        while (name + i in this) i++
+        this += name + i
+    }
+
+    /** This scans one folder for json files and generates lines ***to translate*** (left side).
+     *  All work is done right on instantiation.
+      */
+    private class GenerateStringsFromJSONs(
+        jsonsFolder: FileHandle,
+        fileFilter: (File) -> Boolean = { file -> file.name.endsWith(".json", true) }
+    ): LinkedHashMap<String, MutableSet<String>>() {
+        // Using LinkedHashMap (instead of HashMap) is important to maintain the order of sections in the translation file
+
+        val ruleset = RulesetCache.getVanillaRuleset()
         val startMillis = System.currentTimeMillis()
 
-        // Using LinkedHashMap (instead of HashMap) is important to maintain the order of sections in the translation file
-        val generatedStrings = LinkedHashMap<String, MutableSet<String>>()
-
         var uniqueIndexOfNewLine = 0
-        val jsonParser = JsonParser()
         val listOfJSONFiles = jsonsFolder
-                .list { file -> file.name.endsWith(".json", true) }
-                .sortedBy { it.name() }       // generatedStrings maintains order, so let's feed it a predictable one
+            .list(fileFilter)
+            .sortedBy { it.name() }       // generatedStrings maintains order, so let's feed it a predictable one
 
-        for (jsonFile in listOfJSONFiles) {
-            val filename = jsonFile.nameWithoutExtension()
+        // One set per json file, secondary loop var. Could be nicer to isolate all per-file
+        // processing into another class, but then we'd have to pass uniqueIndexOfNewLine around.
+        lateinit var resultStrings: MutableSet<String>
 
-            val javaClass = getJavaClassByName(filename)
-            if (javaClass == this.javaClass)
-                continue // unknown JSON, let's skip it
+        init {
+            for (jsonFile in listOfJSONFiles) {
+                val filename = jsonFile.nameWithoutExtension()
 
-            val array = jsonParser.getFromJson(javaClass, jsonFile.path())
+                val javaClass = getJavaClassByName(filename)
+                if (javaClass == this.javaClass)
+                    continue // unknown JSON, let's skip it
 
-            generatedStrings[filename] = mutableSetOf()
-            val resultStrings = generatedStrings[filename]!!
+                val array = json().fromJsonFile(javaClass, jsonFile.path())
 
-            fun submitString(string: String) {
-                val unique = Unique(string)
-                if(unique.type?.flags?.contains(UniqueFlag.HiddenToUsers)==true)
-                    return // We don't need to translate this at all, not user-visible
-                var stringToTranslate = string.removeConditionals()
+                resultStrings = mutableSetOf()
+                this[filename] = resultStrings
 
-                val existingParameterNames = HashSet<String>()
-                if (unique.params.isNotEmpty()) {
-                    for ((index,parameter) in unique.params.withIndex()) {
-                        var parameterName = when {
-                            unique.type != null -> {
-                                val possibleParameterTypes = unique.type.parameterTypeMap[index]
-                                // for multiple types. will look like "[unitName/buildingName]"
-                                possibleParameterTypes.joinToString("/") { it.parameterName }
-                            }
-                            parameter.toFloatOrNull() != null -> "amount"
-                            Stat.values().any { it.name == parameter } -> "stat"
-                            parameter in tileFilterMap -> "tileFilter"
-                            ruleset.units.containsKey(parameter) -> "unit"
-                            parameter in tileImprovementMap -> "tileImprovement"
-                            ruleset.tileResources.containsKey(parameter) -> "resource"
-                            ruleset.technologies.containsKey(parameter) -> "tech"
-                            ruleset.unitPromotions.containsKey(parameter) -> "promotion"
-                            parameter in buildingMap -> "building"
-                            parameter in unitTypeMap -> "unitType"
-                            Stats.isStats(parameter) -> "stats"
-                            parameter in UniqueParameterType.cityFilterStrings -> "cityFilter"
-                            else -> "param"
-                        }
-                        if (parameterName in existingParameterNames) {
-                            var i = 2
-                            while (parameterName + i in existingParameterNames) i++
-                            parameterName += i
-                        }
-                        existingParameterNames += parameterName
-
-                        stringToTranslate = stringToTranslate.replaceFirst(parameter, parameterName)
+                @Suppress("RemoveRedundantQualifierName")  // to clarify this is the kotlin way
+                if (array is kotlin.Array<*>)
+                    for (element in array) {
+                        serializeElement(element!!) // let's serialize the strings recursively
+                        // This is a small hack to insert multiple /n into the set, which can't contain identical lines
+                        resultStrings.add("$specialNewLineCode ${uniqueIndexOfNewLine++}")
                     }
-                } else if (string.contains('{')) {
-                    val matches = curlyBraceRegex.findAll(string)
-                    if (matches.any()) {
-                        // Ignore outer string, only translate the parts within `{}`
-                        matches.forEach { submitString(it.groups[1]!!.value) }
-                        return
-                    }
+            }
+            val displayName = if (jsonsFolder.name() != "jsons") jsonsFolder.name()
+                else jsonsFolder.parent().name().ifEmpty { "Tutorials" }  // Show mod name - or special case
+            debug("Translation writer took %sms for %s", System.currentTimeMillis() - startMillis, displayName)
+        }
+
+        fun submitString(string: String) {
+            if (string.isEmpty()) return  // entries in Collection<String> do not pass isFieldTranslatable
+            if ('{' in string) {
+                val matches = curlyBraceRegex.findAll(string)
+                if (matches.any()) {
+                    // Ignore outer string, only translate the parts within `{}`
+                    matches.forEach { submitString(it.groups[1]!!.value) }
+                    return
                 }
-                resultStrings.add("$stringToTranslate = ")
+            }
+            resultStrings.add("$string = ")
+        }
+
+        fun submitString(string: String, unique: Unique) {
+            if (unique.isHiddenToUsers())
+                return // We don't need to translate this at all, not user-visible
+
+            val stringToTranslate = string.removeConditionals()
+            for (conditional in unique.conditionals) {
+                submitString(conditional.text, conditional)
+            }
+
+            if (unique.params.isEmpty()) {
+                submitString(stringToTranslate)
                 return
             }
 
-            fun serializeElement(element: Any) {
-                if (element is String) {
-                    submitString(element)
-                    return
+            // Do simpler parameter numbering when typed, as the code below is susceptible to problems with nested brackets - UniqueTypes don't have them (yet)!
+            if (unique.type != null) {
+                for ((index, typeList) in unique.type.parameterTypeMap.withIndex()) {
+                    if (typeList.none { it in translatableUniqueParameterTypes }) continue
+                    // Unknown/Comment parameter contents better be offered to translators too
+                    resultStrings.add("${unique.params[index]} = ")
                 }
-                val allFields = (
-                            element.javaClass.declaredFields
-                            + element.javaClass.fields
-                            // Include superclass so the main PolicyBranch, which inherits from Policy,
-                            // will recognize its Uniques and have them translated
-                            + element.javaClass.superclass.declaredFields
-                        ).filter {
-                            it.type == String::class.java ||
-                            it.type == java.util.ArrayList::class.java ||
-                            it.type == java.util.List::class.java ||        // CivilopediaText is not an ArrayList
-                            it.type == java.util.HashSet::class.java ||
-                            it.type.isEnum  // allow scanning Enum names
-                        }
-                for (field in allFields) {
-                    field.isAccessible = true
-                    val fieldValue = field.get(element)
-                    if (isFieldTranslatable(javaClass, field, fieldValue)) { // skip fields which must not be translated
-                        // this field can contain sub-objects, let's serialize them as well
-                        @Suppress("RemoveRedundantQualifierName")  // to clarify List does _not_ inherit from anything in java.util
-                        when (fieldValue) {
-                            is java.util.AbstractCollection<*> ->
-                                for (item in fieldValue)
-                                    if (item is String) submitString(item) else serializeElement(item!!)
-                            is kotlin.collections.List<*> ->
-                                for (item in fieldValue)
-                                    if (item is String) submitString(item) else serializeElement(item!!)
-                            else -> submitString(fieldValue.toString())
-                        }
-                    }
-                }
+                resultStrings.add("${unique.type.getTranslatable()} = ")
+                return
             }
 
-            if (array is kotlin.Array<*>)
-                for (element in array) {
-                    serializeElement(element!!) // let's serialize the strings recursively
-                    // This is a small hack to insert multiple /n into the set, which can't contain identical lines
-                    resultStrings.add("$specialNewLineCode ${uniqueIndexOfNewLine++}")
+            val parameterNames = ArrayList<String>()
+            for (parameter in unique.params) {
+                val parameterName = UniqueParameterType.guessTypeForTranslationWriter(parameter, ruleset).parameterName
+                parameterNames.addNumberedParameter(parameterName)
+                if (translatableUniqueParameterTypes.none { it.parameterName == parameterName }) continue
+                resultStrings.add("$parameter = ")
+            }
+            resultStrings.add("${stringToTranslate.fillPlaceholders(*parameterNames.toTypedArray())} = ")
+        }
+
+        // Example: PolicyBranch inherits from Policy inherits from RulesetObject.
+        // RulesetObject has the name and uniques properties and we wish to include them.
+        // So we need superclass recursion to be sure not to miss stuff in the future.
+        // The superclass != null check is made obsolete in theory by the Object check, but better play safe.
+        fun Class<*>.allSupers(): Sequence<Class<*>> = sequence {
+            if (this@allSupers == Object::class.java) return@sequence
+            yield(this@allSupers)
+            if (superclass != null)
+                yieldAll(superclass.allSupers())
+        }
+
+        fun serializeElement(element: Any) {
+            if (element is String) {
+                submitString(element)
+                return
+            }
+
+            // Including `fields` is dubious. AFAIK it is an incomplete view of what we're getting
+            // anyway via superclass recursion. But since we now do a distinct() it won't hurt.
+            val allFields = element.javaClass.fields.asSequence() +
+                    element.javaClass.allSupers().flatMap { it.declaredFields.asSequence() }
+            // Filter by classes we can and want to process, avoid Companion fields
+            // Note lazies are Modifier.TRANSIENT and type == kotlin.Lazy
+            val relevantFields = allFields.filter {
+                    (it.modifiers and (Modifier.STATIC or Modifier.TRANSIENT)) == 0 &&
+                    isFieldTypeRelevant(it.type)
+                    // it.type != element.javaClass  // avoid following infinite loops - redundant as isFieldTypeRelevant won't match
+                }.distinct()  // We do get duplicates even without `fields`, no need to do double work, even if submitString operates on a set
+
+            for (field in relevantFields) {
+                field.isAccessible = true
+                val fieldValue = field.get(element)
+                // skip fields which must not be translated
+                if (!isFieldTranslatable(element.javaClass, field, fieldValue)) continue
+                // Some Tutorial names need no translation
+                if (element is Tutorial && field.name == "name"
+                        && UniqueType.HiddenFromCivilopedia.placeholderText in element.uniques)
+                    continue
+                // this field can contain sub-objects, let's serialize them as well
+                @Suppress("RemoveRedundantQualifierName")  // to clarify List does _not_ inherit from anything in java.util
+                when {
+                    // Promotion names are not uniques but since we did the "[unitName] ability"
+                    // they need the "parameters" treatment too
+                    // Same for victory milestones
+                    (field.name == "uniques" || field.name == "promotions" || field.name == "milestones")
+                            && (fieldValue is java.util.AbstractCollection<*>) ->
+                        for (item in fieldValue)
+                            if (item is String) submitString(item, Unique(item)) else serializeElement(item!!)
+                    fieldValue is java.util.AbstractCollection<*> ->
+                        for (item in fieldValue)
+                            if (item is String) submitString(item) else serializeElement(item!!)
+                    fieldValue is kotlin.collections.List<*> ->
+                        for (item in fieldValue)
+                            if (item is String) submitString(item) else serializeElement(item!!)
+                    element is Promotion && field.name == "name" ->  // see above
+                        submitString(fieldValue.toString(), Unique(fieldValue.toString()))
+                    else -> submitString(fieldValue.toString())
                 }
+            }
         }
-        println("Translation writer took ${System.currentTimeMillis()-startMillis}ms for ${jsonsFolder.name()}")
 
-        return generatedStrings
-    }
+        companion object {
+            /** Exclude fields by name that contain references to items defined elsewhere
+             * or are otherwise Strings but not user-displayed.
+             *
+             * An exclusion applies either over _all_ json files and all classes contained in them
+             * or Class-specific by using a "Class.Field" notation.
+             */
+            private val untranslatableFieldSet = setOf(
+                "aiFreeTechs", "aiFreeUnits", "attackSound", "building", "cannotBeBuiltWith",
+                "cultureBuildings", "excludedDifficulties", "improvement", "improvingTech",
+                "obsoleteTech", "occursOn", "prerequisites", "promotions",
+                "providesFreeBuilding", "replaces", "requiredBuilding", "requiredBuildingInAllCities",
+                "requiredNearbyImprovedResources", "requiredResource", "requiredTech", "requires",
+                "revealedBy", "startBias", "techRequired", "terrainsCanBeBuiltOn",
+                "terrainsCanBeFoundOn", "turnsInto", "uniqueTo", "upgradesTo",
+                "link", "icon", "extraImage", "color",  // FormattedLine
+                "RuinReward.uniques", "TerrainType.name",
+                "CityStateType.friendBonusUniques", "CityStateType.allyBonusUniques",
+                "Era.citySound",
+            )
 
-    /** Exclude fields by name that contain references to items defined elsewhere
-     * or are otherwise Strings but not user-displayed.
-     *
-     * An exclusion applies either over _all_ json files and all classes contained in them
-     * or Class-specific by using a "Class.Field" notation.
-     */
-    private val untranslatableFieldSet = setOf(
-            "aiFreeTechs", "aiFreeUnits", "attackSound", "building",
-            "cannotBeBuiltWith", "cultureBuildings", "improvement", "improvingTech",
-            "obsoleteTech", "occursOn", "prerequisites", "promotions",
-            "providesFreeBuilding", "replaces", "requiredBuilding", "requiredBuildingInAllCities",
-            "requiredNearbyImprovedResources", "requiredResource", "requiredTech", "requires",
-            "resourceTerrainAllow", "revealedBy", "startBias", "techRequired",
-            "terrainsCanBeBuiltOn", "terrainsCanBeFoundOn", "turnsInto", "uniqueTo", "upgradesTo",
-            "link", "icon", "extraImage", "color",  // FormattedLine
-            "excludedDifficulties", "RuinReward.uniques"      // RuinReward
-    )
-    /** Specifies Enums where the name property _is_ translatable, by Class name */
-    private val translatableEnumsSet = setOf("BeliefType")
+            /** Specifies Enums where the name property _is_ translatable, by Class name */
+            private val translatableEnumsSet = setOf("BeliefType")
 
-    /** Checks whether a field's value should be included in the translation templates.
-     * Applies explicit field exclusions from [untranslatableFieldSet].
-     * The Modifier.STATIC exclusion removes fields from e.g. companion objects.
-     * Fields of enum types need that type explicitly allowed in [translatableEnumsSet]
-     */
-    private fun isFieldTranslatable(clazz: Class<*>, field: Field, fieldValue: Any?): Boolean {
-        return fieldValue != null &&
-                fieldValue != "" &&
-                (field.modifiers and Modifier.STATIC) == 0 &&
-                (!field.type.isEnum || field.type.simpleName in translatableEnumsSet) &&
-                field.name !in untranslatableFieldSet &&
-                (clazz.componentType?.simpleName ?: clazz.simpleName) + "." + field.name !in untranslatableFieldSet
-    }
+            /** Only these Unique parameter types will be offered as translatables - for all others it is expected their content
+             *  corresponds with a ruleset object name which will be made translatable by their actual json definition */
+            private val translatableUniqueParameterTypes = setOf(
+                UniqueParameterType.Unknown,
+                UniqueParameterType.Comment
+            )
 
-    private fun getJavaClassByName(name: String): Class<Any> {
-        return when (name) {
-            "Beliefs" -> emptyArray<Belief>().javaClass
-            "Buildings" -> emptyArray<Building>().javaClass
-            "Difficulties" -> emptyArray<Difficulty>().javaClass
-            "Eras" -> emptyArray<Era>().javaClass
-            "Nations" -> emptyArray<Nation>().javaClass
-            "Policies" -> emptyArray<PolicyBranch>().javaClass
-            "Quests" -> emptyArray<Quest>().javaClass
-            "Religions" -> emptyArray<String>().javaClass
-            "Ruins" -> emptyArray<RuinReward>().javaClass
-            "Specialists" -> emptyArray<Specialist>().javaClass
-            "Techs" -> emptyArray<TechColumn>().javaClass
-            "Terrains" -> emptyArray<Terrain>().javaClass
-            "TileImprovements" -> emptyArray<TileImprovement>().javaClass
-            "TileResources" -> emptyArray<TileResource>().javaClass
-            "Tutorials" -> this.javaClass // dummy value
-            "UnitPromotions" -> emptyArray<Promotion>().javaClass
-            "Units" -> emptyArray<BaseUnit>().javaClass
-            "UnitTypes" -> emptyArray<UnitType>().javaClass
-            else -> this.javaClass // dummy value
+            private fun isFieldTypeRelevant(type: Class<*>) =
+                    type == String::class.java ||
+                    type == java.util.ArrayList::class.java ||
+                    type == java.util.List::class.java ||        // CivilopediaText is not an ArrayList
+                    type == java.util.HashSet::class.java ||
+                    type.isEnum  // allow scanning Enum names
+
+            /** Checks whether a field's value should be included in the translation templates.
+             * Applies explicit field exclusions from [untranslatableFieldSet].
+             * The Modifier.STATIC exclusion removes fields from e.g. companion objects.
+             * Fields of enum types need that type explicitly allowed in [translatableEnumsSet]
+             */
+            private fun isFieldTranslatable(clazz: Class<*>, field: Field, fieldValue: Any?): Boolean {
+                return fieldValue != null &&
+                        fieldValue != "" &&
+                        (!field.type.isEnum || field.type.simpleName in translatableEnumsSet) &&
+                        field.name !in untranslatableFieldSet &&
+                        (clazz.componentType?.simpleName ?: clazz.simpleName) + "." + field.name !in untranslatableFieldSet
+            }
+
+            private fun getJavaClassByName(name: String): Class<Any> {
+                return when (name) {
+                    "Beliefs" -> emptyArray<Belief>().javaClass
+                    "Buildings" -> emptyArray<Building>().javaClass
+                    "Difficulties" -> emptyArray<Difficulty>().javaClass
+                    "Eras" -> emptyArray<Era>().javaClass
+                    "Speeds" -> emptyArray<Speed>().javaClass
+                    "GlobalUniques" -> GlobalUniques().javaClass
+                    "Nations" -> emptyArray<Nation>().javaClass
+                    "Policies" -> emptyArray<PolicyBranch>().javaClass
+                    "Quests" -> emptyArray<Quest>().javaClass
+                    "Religions" -> emptyArray<String>().javaClass
+                    "Ruins" -> emptyArray<RuinReward>().javaClass
+                    "Specialists" -> emptyArray<Specialist>().javaClass
+                    "Techs" -> emptyArray<TechColumn>().javaClass
+                    "Terrains" -> emptyArray<Terrain>().javaClass
+                    "TileImprovements" -> emptyArray<TileImprovement>().javaClass
+                    "TileResources" -> emptyArray<TileResource>().javaClass
+                    "Tutorials" -> emptyArray<Tutorial>().javaClass
+                    "UnitPromotions" -> emptyArray<Promotion>().javaClass
+                    "Units" -> emptyArray<BaseUnit>().javaClass
+                    "UnitTypes" -> emptyArray<UnitType>().javaClass
+                    "VictoryTypes" -> emptyArray<Victory>().javaClass
+                    "CityStateTypes" -> emptyArray<CityStateType>().javaClass
+                    "Events" -> emptyArray<Event>().javaClass
+                    else -> this.javaClass // dummy value
+                }
+            }
         }
     }
 
+    //endregion
+    //region Fastlane
+
+    /** This writes translated short_description.txt and full_description.txt files into the Fastlane structure.
+     *  @param [translations] A [Translations] instance with all languages loaded.
+     *  @return Success or error message.
+     */
+    private fun writeTranslatedFastlaneFiles(translations: Translations): String {
+        @Suppress("LiftReturnOrAssignment")  // clearer with explicit returns
+        try {
+            writeFastlaneFiles(shortDescriptionFile, translations[shortDescriptionKey], false)
+            writeFastlaneFiles(fullDescriptionFile, translations[fullDescriptionKey], true)
+            updateFastlaneChangelog()
+
+            return "Fastlane files are generated successfully.".tr()
+        } catch (ex: Throwable) {
+            Log.error("Failed to generate fastlane files", ex)
+            return ex.localizedMessage ?: ex.javaClass.simpleName
+        }
+    }
+
+    private fun writeFastlaneFiles(fileName: String, translationEntry: TranslationEntry?, endWithNewline: Boolean) {
+        if (translationEntry == null) return
+        for ((language, translated) in translationEntry) {
+            val fileContent = when {
+                endWithNewline && !translated.endsWith('\n') -> translated + '\n'
+                !endWithNewline && translated.endsWith('\n') -> translated.removeSuffix("\n")
+                else -> translated
+            }
+            val localeCode = LocaleCode.valueOf(language.replace("_",""))
+            val path = fastlanePath + (localeCode.trueLanguage ?: localeCode.language)
+            File(path).mkdirs()
+            File(path + File.separator + fileName).writeText(fileContent)
+        }
+    }
+
+    // Original changelog entry, written by incrementVersionAndChangelog, is often changed manually for readability.
+    // This updates the fastlane changelog entry to match the latest one in changelog.md
+    private fun updateFastlaneChangelog() {
+        // Relative path since we're in android/assets
+        val changelogFile = File("../../changelog.md").readText()
+        //  changelogs by definition do not have #'s in them so we can use it as a delimiter
+        val latestVersionRegexGroup = Regex("## \\S*([^#]*)").find(changelogFile)
+        val versionChangelog = latestVersionRegexGroup!!.groups[1]!!.value.trim()
+
+        val buildConfigFile = File("../../buildSrc/src/main/kotlin/BuildConfig.kt").readText()
+        val versionNumber =
+            Regex("appCodeNumber = (\\d*)").find(buildConfigFile)!!.groups[1]!!.value
+
+        val fileName = "$fastlanePath/en-US/changelogs/$versionNumber.txt"
+        File(fileName).writeText(versionChangelog)
+    }
+    //endregion
 }

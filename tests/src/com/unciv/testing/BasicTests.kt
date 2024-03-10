@@ -2,18 +2,24 @@
 package com.unciv.testing
 
 import com.badlogic.gdx.Gdx
+import com.unciv.Constants
 import com.unciv.UncivGame
-import com.unciv.UncivGameParameters
 import com.unciv.models.metadata.BaseRuleset
 import com.unciv.models.metadata.GameSettings
 import com.unciv.models.ruleset.Ruleset
 import com.unciv.models.ruleset.RulesetCache
+import com.unciv.models.ruleset.RulesetStatsObject
+import com.unciv.models.ruleset.unique.Unique
 import com.unciv.models.ruleset.unique.UniqueParameterType
 import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.stats.Stat
 import com.unciv.models.stats.Stats
 import com.unciv.models.translations.getPlaceholderParameters
+import com.unciv.models.translations.getPlaceholderText
+import com.unciv.utils.DebugUtils
+import com.unciv.utils.Log
+import com.unciv.utils.debug
 import org.junit.Assert
 import org.junit.Before
 import org.junit.Test
@@ -27,14 +33,15 @@ class BasicTests {
     var ruleset = Ruleset()
     @Before
     fun loadTranslations() {
-        RulesetCache.loadRulesets()
-        ruleset = RulesetCache.getBaseRuleset()
+        Log.shouldLog()
+        RulesetCache.loadRulesets(noMods = true)
+        ruleset = RulesetCache.getVanillaRuleset()
     }
 
     @Test
     fun gamePngExists() {
         Assert.assertTrue("This test will only pass when the game.png exists",
-                Gdx.files.local("game.png").exists())
+                Gdx.files.local("").list().any { it.name().endsWith(".png") })
     }
 
     @Test
@@ -45,25 +52,25 @@ class BasicTests {
 
     @Test
     fun gameIsNotRunWithDebugModes() {
-        val params = UncivGameParameters("", null)
-        val game = UncivGame(params)
+        val game = UncivGame()
         Assert.assertTrue("This test will only pass if the game is not run with debug modes",
-                !game.superchargedForDebug
-                        && !game.viewEntireMapForDebug
-                        && game.simulateUntilTurnForDebug <= 0
-                        && !game.consoleMode
+                !DebugUtils.SUPERCHARGED
+                        && !DebugUtils.VISIBLE_MAP
+                        && DebugUtils.SIMULATE_UNTIL_TURN <= 0
+                        && !game.isConsoleMode
         )
     }
 
     // If there's a unit that obsoletes with no upgrade then when it obsoletes
 // and we try to work on its upgrade, we'll get an exception - see techManager
+    // But...Scout obsoletes at Scientific Theory with no upgrade...?
     @Test
     fun allObsoletingUnitsHaveUpgrades() {
         val units: Collection<BaseUnit> = ruleset.units.values
         var allObsoletingUnitsHaveUpgrades = true
         for (unit in units) {
-            if (unit.obsoleteTech != null && unit.upgradesTo == null && unit.name !="Scout" ) {
-                println(unit.name + " obsoletes but has no upgrade")
+            if (unit.techsAtWhichAutoUpgradeInProduction().any() && unit.upgradesTo == null && unit.name !="Scout" ) {
+                debug("%s obsoletes but has no upgrade", unit.name)
                 allObsoletingUnitsHaveUpgrades = false
             }
         }
@@ -71,7 +78,7 @@ class BasicTests {
     }
 
     @Test
-    fun statParserWorks(){
+    fun statParserWorks() {
         Assert.assertTrue(Stats.isStats("+1 Production"))
         Assert.assertTrue(Stats.isStats("+1 Gold, +2 Production"))
         Assert.assertFalse(Stats.isStats("+1 Gold from tree"))
@@ -79,7 +86,7 @@ class BasicTests {
         val statsThatShouldBe = Stats(gold = 1f, production = 2f)
         Assert.assertTrue(Stats.parse("+1 Gold, +2 Production").equals(statsThatShouldBe))
 
-        UncivGame.Current = UncivGame("")
+        UncivGame.Current = UncivGame()
         UncivGame.Current.settings = GameSettings().apply { language = "Italian" }
     }
 
@@ -89,7 +96,7 @@ class BasicTests {
             val ruleset = RulesetCache[baseRuleset.fullName]!!
             val modCheck = ruleset.checkModLinks()
             if (modCheck.isNotOK())
-                println(modCheck.getErrorText(true))
+                debug("%s", modCheck.getErrorText(true))
             Assert.assertFalse(modCheck.isNotOK())
         }
     }
@@ -98,6 +105,7 @@ class BasicTests {
     fun uniqueTypesHaveNoUnknownParameters() {
         var noUnknownParameters = true
         for (uniqueType in UniqueType.values()) {
+            if (uniqueType.getDeprecationAnnotation()!=null) continue
             for (entry in uniqueType.parameterTypeMap.withIndex()) {
                 for (paramType in entry.value) {
                     if (paramType == UniqueParameterType.Unknown) {
@@ -116,11 +124,178 @@ class BasicTests {
         var allOK = true
         for (uniqueType in UniqueType.values()) {
             if (uniqueType.targetTypes.isEmpty()) {
-                println("${uniqueType.name} has no targets.")
+                debug("%s has no targets.", uniqueType.name)
                 allOK = false
             }
         }
         Assert.assertTrue("This test succeeds only if all UniqueTypes have at least one UniqueTarget", allOK)
+    }
+
+    @Test
+    fun allUnitsUniquesHaveTheirUniqueTypes() {
+        val units: Collection<BaseUnit> = ruleset.units.values
+        var allOK = true
+        for (unit in units) {
+            for (unique in unit.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    debug("%s: %s", unit.name, unique)
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all uniques of units are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allBuildingsUniquesHaveTheirUniqueTypes() {
+        val buildings = ruleset.buildings.values
+        var allOK = true
+        for (building in buildings) {
+            for (unique in building.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    debug("%s: %s", building.name, unique)
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all uniques of buildings are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allPromotionsUniquesHaveTheirUniqueTypes() {
+        val promotions = ruleset.unitPromotions.values
+        var allOK = true
+        for (promotion in promotions) {
+            for (unique in promotion.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    debug("%s: %s", promotion.name, unique)
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all uniques of promotions are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allTerrainRelatedUniquesHaveTheirUniqueTypes() {
+        val objects : MutableCollection<RulesetStatsObject> = mutableListOf()
+        objects.addAll(ruleset.tileImprovements.values)
+        objects.addAll(ruleset.tileResources.values)
+        objects.addAll(ruleset.terrains.values)
+        var allOK = true
+        for (obj in objects) {
+            for (unique in obj.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    debug("%s: %s", obj.name, unique)
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all uniques are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allPolicyRelatedUniquesHaveTheirUniqueTypes() {
+        val policies = ruleset.policies.values
+        var allOK = true
+        for (policy in policies) {
+            for (unique in policy.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    println("${policy.name}: $unique")
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all policy uniques are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allBeliefRelatedUniquesHaveTheirUniqueTypes() {
+        val ruleset = RulesetCache[BaseRuleset.Civ_V_GnK.fullName]!!.clone() // vanilla doesn't have beliefs
+        val beliefs = ruleset.beliefs.values
+        var allOK = true
+        for (belief in beliefs) {
+            for (unique in belief.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    println("${belief.name}: $unique")
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all belief uniques are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allEraRelatedUniquesHaveTheirUniqueTypes() {
+        val eras = ruleset.eras.values
+        var allOK = true
+        for (era in eras) {
+            for (unique in era.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    println("${era.name}: $unique")
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all era uniques are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allRuinRelatedUniquesHaveTheirUniqueTypes() {
+        val ruinRewards = ruleset.ruinRewards.values
+        var allOK = true
+        for (reward in ruinRewards) {
+            for (unique in reward.uniques) {
+                if (!UniqueType.values().any { it.placeholderText == unique.getPlaceholderText() }) {
+                    println("${reward.name}: $unique")
+                    allOK = false
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all ruin reward uniques are presented in UniqueType.values()", allOK)
+    }
+
+    @Test
+    fun allDeprecatedUniqueTypesHaveReplacewithThatMatchesOtherType() {
+        var allOK = true
+        for (uniqueType in UniqueType.values()) {
+            val deprecationAnnotation = uniqueType.getDeprecationAnnotation() ?: continue
+
+            val uniquesToCheck = deprecationAnnotation.replaceWith.expression.split("\", \"", Constants.uniqueOrDelimiter)
+
+            for (uniqueText in uniquesToCheck) {
+                val replacementTextUnique = Unique(uniqueText)
+
+
+                if (replacementTextUnique.type == null) {
+                    debug("%s's deprecation text \"%s\" does not match any existing type!", uniqueType.name, uniqueText)
+                    allOK = false
+                }
+                if (replacementTextUnique.type == uniqueType) {
+                    debug("%s's deprecation text references itself!", uniqueType.name)
+                    allOK = false
+                }
+                for (conditional in replacementTextUnique.conditionals) {
+                    if (conditional.type == null) {
+                        debug("%s's deprecation text contains conditional \"%s\" which does not match any existing type!", uniqueType.name, conditional.text)
+                        allOK = false
+                    }
+                }
+
+                var iteration = 1
+                var replacementUnique = Unique(uniqueType.placeholderText)
+                while (replacementUnique.getDeprecationAnnotation() != null) {
+                    if (iteration == 10) {
+                        allOK = false
+                        debug("%s's deprecation text never references an undeprecated unique!", uniqueType.name)
+                        break
+                    }
+                    iteration++
+                    replacementUnique = Unique(replacementUnique.getReplacementText(ruleset))
+                }
+            }
+        }
+        Assert.assertTrue("This test succeeds only if all deprecated uniques have a replaceWith text that matches an existing type", allOK)
     }
 
     //@Test  // commented so github doesn't run this
@@ -130,7 +305,7 @@ class BasicTests {
         Thread.sleep(5000) // makes timings a little more repeatable
         val startTime = System.nanoTime()
         statMathRunner(iterations = 1_000_000)
-        println("statMathStressTest took ${(System.nanoTime()-startTime)/1000}µs")
+        debug("statMathStressTest took %sµs", (System.nanoTime()-startTime) / 1000)
     }
 
     @Test
@@ -155,7 +330,7 @@ class BasicTests {
         val statCount = Stat.values().size
         val stats = Stats()
 
-        for (i in 0 until iterations) {
+        repeat(iterations) {
             val value: Float = random.nextDouble(-10.0, 10.0).toFloat()
             stats.add( Stats(gold = value) )
             stats.forEach {

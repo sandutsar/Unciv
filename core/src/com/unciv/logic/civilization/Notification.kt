@@ -1,103 +1,159 @@
 package com.unciv.logic.civilization
 
-import com.badlogic.gdx.math.Vector2
-import com.unciv.models.stats.Stat
-import com.unciv.ui.cityscreen.CityScreen
-import com.unciv.ui.pickerscreens.PolicyPickerScreen
-import com.unciv.ui.pickerscreens.TechPickerScreen
-import com.unciv.ui.trade.DiplomacyScreen
-import com.unciv.ui.utils.MayaCalendar
-import com.unciv.ui.worldscreen.WorldScreen
+import com.badlogic.gdx.scenes.scene2d.Actor
+import com.badlogic.gdx.scenes.scene2d.ui.Table
+import com.badlogic.gdx.utils.Json
+import com.badlogic.gdx.utils.JsonValue
+import com.unciv.logic.IsPartOfGameInfoSerialization
+import com.unciv.models.ruleset.Ruleset
+import com.unciv.ui.images.ImageGetter
+import com.unciv.ui.screens.worldscreen.WorldScreen
 
-object NotificationIcon {
-    // Remember: The typical white-on-transparency icon will not be visible on Notifications
-    const val Culture = "StatIcons/Culture"
-    const val Construction = "StatIcons/Production"
-    const val Growth = "StatIcons/Population"
-    const val War = "OtherIcons/Pillage"
-    const val Trade = "StatIcons/Acquire"
-    const val Science = "StatIcons/Science"
-    const val Gold = "StatIcons/Gold"
-    const val Death = "OtherIcons/DisbandUnit"
-    const val Diplomacy = "OtherIcons/Diplomacy"
-    const val City = "ImprovementIcons/City center"
-    const val Citadel = "ImprovementIcons/Citadel"
-    const val Happiness = "StatIcons/Happiness"
-    const val Population = "StatIcons/Population"
-    const val CityState = "OtherIcons/CityState"
-    const val Production = "StatIcons/Production"
-    const val Food = "StatIcons/Food"
-    const val Faith = "StatIcons/Faith"
-    const val Crosshair = "OtherIcons/CrosshairB"
-}
 
-/**
- * [action] is not realized as lambda, as it would be too easy to introduce references to objects
- * there that should not be serialized to the saved game.
- */
-open class Notification() {
+typealias NotificationCategory = Notification.NotificationCategory
 
+open class Notification() : IsPartOfGameInfoSerialization {
+    /** Category - UI grouping, within a Category the most recent Notification will be shown on top */
+    var category: NotificationCategory = NotificationCategory.General
+        private set
+
+    /** The notification text, untranslated - will be translated on the fly */
     var text: String = ""
+        private set
 
+    /** Icons to be shown */
     var icons: ArrayList<String> = ArrayList() // Must be ArrayList and not List so it can be deserialized
-    var action: NotificationAction? = null
+        private set
 
-    constructor(text: String, notificationIcons: ArrayList<String>, action: NotificationAction? = null) : this() {
+    /** Actions on clicking a Notification - will be activated round-robin style */
+    var actions: ArrayList<NotificationAction> = ArrayList()
+        private set
+
+    constructor(
+        text: String,
+        notificationIcons: Array<out String>,  // `out` needed so we can pass a vararg directly
+        actions: Iterable<NotificationAction>?,
+        category: NotificationCategory = NotificationCategory.General
+    ) : this() {
+        this.category = category
         this.text = text
-        this.icons = notificationIcons
-        this.action = action
+        notificationIcons.toCollection(this.icons)
+        actions?.toCollection(this.actions)
     }
-}
 
-/** defines what to do if the user clicks on a notification */
-interface NotificationAction {
-    fun execute(worldScreen: WorldScreen)
-}
+    enum class NotificationCategory {
+        // These names are displayed, so remember to add a translation template
+        // - if there's no other source for one.
+        General,
+        Trade,
+        Diplomacy,
+        Production,
+        Units,
+        War,
+        Religion,
+        Espionage,
+        Cities
+        ;
 
-/** cycle through tiles */
-data class LocationAction(var locations: ArrayList<Vector2> = ArrayList()) : NotificationAction {
-
-    constructor(locations: List<Vector2>) : this(ArrayList(locations))
-
-    override fun execute(worldScreen: WorldScreen) {
-        if (locations.isNotEmpty()) {
-            var index = locations.indexOf(worldScreen.mapHolder.selectedTile?.position)
-            index = ++index % locations.size // cycle through tiles
-            worldScreen.mapHolder.setCenterPosition(locations[index], selectUnit = false)
+        companion object {
+            fun safeValueOf(name: String): NotificationCategory? =
+                values().firstOrNull { it.name == name }
         }
     }
-}
 
-/** show tech screen */
-class TechAction(val techName: String = "") : NotificationAction {
-    override fun execute(worldScreen: WorldScreen) {
-        val tech = worldScreen.gameInfo.ruleSet.technologies[techName]
-        worldScreen.game.setScreen(TechPickerScreen(worldScreen.viewingCiv, tech))
-    }
-}
+    @Transient
+    /** For round-robin activation in [execute] */
+    private var index = 0
 
-/** enter city */
-data class CityAction(val city: Vector2 = Vector2.Zero): NotificationAction {
-    override fun execute(worldScreen: WorldScreen) {
-        worldScreen.mapHolder.tileMap[city].getCity()?.let {
-            if (it.civInfo == worldScreen.viewingCiv)
-                worldScreen.game.setScreen(CityScreen(it))
+    fun addNotificationIconsTo(table: Table, ruleset: Ruleset, iconSize: Float) {
+        if (icons.isEmpty()) return
+        for (icon in icons.reversed()) {
+            val image: Actor = when {
+                ruleset.technologies.containsKey(icon) ->
+                    ImageGetter.getTechIconPortrait(icon, iconSize)
+                ruleset.nations.containsKey(icon) ->
+                    ImageGetter.getNationPortrait(ruleset.nations[icon]!!, iconSize)
+                ruleset.units.containsKey(icon) ->
+                    ImageGetter.getUnitIcon(icon)
+                else ->
+                    ImageGetter.getImage(icon)
+            }
+            table.add(image).size(iconSize).padRight(5f)
         }
     }
-}
 
-/** enter diplomacy screen */
-data class DiplomacyAction(val otherCivName: String = ""): NotificationAction {
-    override fun execute(worldScreen: WorldScreen) {
-        val screen = DiplomacyScreen(worldScreen.viewingCiv)
-        screen.updateRightSide(worldScreen.gameInfo.getCivilization(otherCivName))
-        worldScreen.game.setScreen(screen)
+    fun execute(worldScreen: WorldScreen) {
+        if (actions.isEmpty()) return
+        actions[index].execute(worldScreen)
+        index = ++index % actions.size // cycle through tiles
     }
-}
 
-/** enter Maya Long Count popup */
-class MayaLongCountAction() : NotificationAction {
-    override fun execute(worldScreen: WorldScreen) {
-        MayaCalendar.openPopup(worldScreen, worldScreen.selectedCiv, worldScreen.gameInfo.getYear())
+    fun resetExecuteRoundRobin() {
+        index = 0
+    }
+
+    /**
+     *  Custom [Gdx.Json][Json] serializer/deserializer for one [Notification].
+     *
+     *  Example of the serialized format:
+     *  ```json
+     *  "notifications":[
+     *      {
+     *          "category":"Production",
+     *          "text":"[Nobel Foundation] has been built in [Stockholm]",
+     *          "icons":["BuildingIcons/Nobel Foundation"],
+     *          "actions":[
+     *              {"LocationAction":{"location":{"x":9,"y":3}}},
+     *              {"CivilopediaAction":{"link":"Wonder/Nobel Foundation"}},
+     *              {"CityAction":{"city":{"x":9,"y":3}}}
+     *          ]
+     *      }
+     *  ]
+     *  ```
+     */
+    class Serializer : Json.Serializer<Notification> {
+
+        override fun write(json: Json, notification: Notification, knownType: Class<*>?) {
+            json.writeObjectStart()
+            if (notification.category != NotificationCategory.General)
+                json.writeValue("category", notification.category)
+            if (notification.text.isNotEmpty())
+                json.writeValue("text", notification.text)
+            if (notification.icons.isNotEmpty())
+                json.writeValue("icons", notification.icons, null, String::class.java)
+
+            writeActions(json, notification)
+
+            json.writeObjectEnd()
+        }
+
+        private fun writeActions(json: Json, notification: Notification) {
+            if (notification.actions.isEmpty()) return
+            json.writeArrayStart("actions")
+            for (action in notification.actions) {
+                json.writeObjectStart()
+                json.writeObjectStart(action::class.java.simpleName)
+                json.writeFields(action)
+                json.writeObjectEnd()
+                json.writeObjectEnd()
+            }
+            json.writeArrayEnd()
+        }
+
+        override fun read(json: Json, jsonData: JsonValue, type: Class<*>?) = Notification().apply {
+            json.readField(this, "category", jsonData)
+            json.readField(this, "text", jsonData)
+            readActions(json, jsonData)
+            json.readField(this, "icons", jsonData)
+        }
+
+        private fun Notification.readActions(json: Json, jsonData: JsonValue) {
+            if (!jsonData.hasChild("actions")) return
+            var entry = jsonData.get("actions").child
+            while (entry != null) {
+                actions.addAll(NotificationActionsDeserializer().read(json, entry))
+                entry = entry.next
+            }
+        }
     }
 }
